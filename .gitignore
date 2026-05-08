@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+dist/
+build/
+*.spec.log
+.audimo-audiobooks/
