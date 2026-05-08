@@ -9,6 +9,7 @@
     "resolve.sources",
     "resolve.stream"
   ],
+  "source_contexts": ["audiobook"],
   "binaries": {
     "darwin-arm64": {
       "url": "https://github.com/audimo-addons/audimo-audiobooks/releases/latest/download/audimo-audiobooks-darwin-arm64",
