@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import urllib.parse
 from pathlib import Path
 
 import httpx
@@ -21,8 +23,30 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from sources import archive_org, librivox
+from sources import archive_org, librivox, bep15
 from sources.audiobookbay import search_audiobookbay, _abb_fetch_magnet
+
+# Canonical UDP tracker pool used to BEP-15 verify torrents that don't
+# carry their own working trackers. Mirrors the indexers addon's
+# _shared.TRACKERS — these are well-known, long-lived public trackers
+# that index a wide swath of public torrents and respond reliably.
+_TRACKERS = (
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.tracker.cl:1337/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://explodie.org:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+)
+
+# AudiobookBay seeder verify config. Search returns up to ~9 rows
+# typically; fetching the magnet for each is one HTTP round-trip per
+# row, so we cap concurrency to 3 to stay polite. The overall budget
+# bounds total search latency — anything not done by the deadline
+# stays on the indexer-supplied count (zero, in ABB's case).
+_VERIFY_FETCH_SEM = asyncio.Semaphore(3)
+_VERIFY_OVERALL_TIMEOUT_S = 8.0
+_INFO_HASH_RE = re.compile(r"urn:btih:([0-9a-fA-F]{40})", re.IGNORECASE)
 
 PORT = int(os.environ.get("AUDIMO_ADDON_PORT", 9008))
 SETTINGS_PATH = Path(os.environ.get("AUDIMO_ADDON_DATA", Path.home() / ".audimo-audiobooks")) / "settings.json"
@@ -160,6 +184,73 @@ def _abb_title_ok(source_name: str, search_title: str) -> bool:
     return matched >= max(1, len(st_words) - 1)
 
 
+def _parse_magnet(magnet: str) -> tuple[str, list[str]]:
+    """Pull info_hash + tracker list out of a magnet URI. Returns
+    ``(info_hash_hex, [tracker_url, …])``; either may be empty if the
+    magnet is malformed."""
+    m = _INFO_HASH_RE.search(magnet or "")
+    info_hash = m.group(1).lower() if m else ""
+    trackers: list[str] = []
+    try:
+        qs = urllib.parse.urlparse(magnet).query
+        for k, v in urllib.parse.parse_qsl(qs, keep_blank_values=False):
+            if k == "tr" and v:
+                trackers.append(v)
+    except Exception:
+        pass
+    return info_hash, trackers
+
+
+async def _abb_verify_one(cfg: dict, source: dict) -> dict:
+    """Fetch the AudiobookBay detail page for this row's slug, parse
+    the magnet, BEP-15 announce against the magnet's trackers ∪ the
+    canonical pool, and stamp ``info_hash`` + a real ``seeders`` count
+    on the source. AudiobookBay's HTML listing pages don't expose
+    seeder counts so without this every row would show 0 — which is
+    indistinguishable from "dead torrent" in the source picker.
+
+    Failure modes are silent: a row that can't be verified passes
+    through unchanged. Caller is expected to bound the overall verify
+    budget so a slow tracker pool doesn't block search."""
+    slug = (source.get("topic_id") or "").strip()
+    if not slug:
+        return source
+    try:
+        async with _VERIFY_FETCH_SEM:
+            magnet = await _abb_fetch_magnet(cfg, slug) or ""
+    except Exception:
+        return source
+    if not magnet:
+        return source
+    info_hash, magnet_trackers = _parse_magnet(magnet)
+    if not info_hash:
+        return source
+    # Magnet trackers + canonical pool, dedup. Magnet trackers come
+    # first so a torrent's "real" trackers get priority within
+    # bep15.verify_torrent's max_trackers cap.
+    seen: set[str] = set()
+    tracker_pool: list[str] = []
+    for tr in [*magnet_trackers, *_TRACKERS]:
+        if tr not in seen:
+            seen.add(tr)
+            tracker_pool.append(tr)
+    try:
+        health = await bep15.verify_torrent(
+            info_hash,
+            tracker_pool,
+            per_tracker_timeout=4.0,
+            max_trackers=5,
+        )
+    except Exception:
+        return source
+    out = {**source, "info_hash": info_hash}
+    if health.get("seeders", 0) > 0:
+        out["seeders"] = int(health["seeders"])
+    if health.get("peers"):
+        out["peers"] = health["peers"]
+    return out
+
+
 async def _abb_search_wrapped(cfg: dict, title: str, author: str) -> list[dict]:
     try:
         ctx = {"title": title, "artist": author, "kind": "audiobook"}
@@ -178,7 +269,37 @@ async def _abb_search_wrapped(cfg: dict, title: str, author: str) -> list[dict]:
                 s["source_id"] = f"abb:{slug}"
             s["addon_id"] = "audimo-audiobooks"
             out.append(s)
-        return out
+
+        if not out:
+            return out
+
+        # Verify pass: fetch each row's magnet, BEP-15 announce, stamp
+        # real seeders. Bounded by a single overall timeout so a slow
+        # tracker pool can't blow the search latency budget; any rows
+        # that didn't verify by the deadline stay on the indexer's
+        # zero-seeder placeholder rather than getting dropped.
+        tasks = [asyncio.create_task(_abb_verify_one(cfg, s)) for s in out]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=_VERIFY_OVERALL_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+        verified: list[dict] = []
+        for original, t in zip(out, tasks):
+            if t.done() and not t.cancelled() and not t.exception():
+                verified.append(t.result())
+            else:
+                verified.append(original)
+        # Sort by seeders desc — the source picker's default ordering
+        # already does this for torrent rows, but stamping it here
+        # means the same order survives addon → orchestrator merge
+        # even when the picker's ranker is set to the default.
+        verified.sort(key=lambda s: int(s.get("seeders") or 0), reverse=True)
+        return verified
     except Exception:
         return []
 
