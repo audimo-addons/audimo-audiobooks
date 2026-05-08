@@ -1,0 +1,191 @@
+name: release
+
+# Build per-platform PyInstaller binaries and attach them to a release,
+# alongside a manifest.json the Audimo desktop app's catalog runtime
+# fetches at install time.
+#
+# Trigger by pushing a tag of the form `audiobooks-vX.Y.Z`, or run
+# manually via workflow_dispatch (useful when re-publishing the same
+# version with a fix).
+
+on:
+  push:
+    tags:
+      - 'audiobooks-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (without leading v)'
+        required: true
+        default: '0.2.0'
+
+permissions:
+  contents: write
+
+jobs:
+  smoke:
+    name: import smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - run: python -c "from server import app; print('routes:', len(app.routes))"
+      - run: python -c "from sources import archive_org, librivox; from sources.audiobookbay import search_audiobookbay, _abb_fetch_magnet"
+
+  build:
+    needs: smoke
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14         # arm64
+            target: darwin-arm64
+            artifact: audimo-audiobooks-darwin-arm64
+          # darwin-x64 (Intel Mac) intentionally omitted — macos-13
+          # runners are capacity-constrained on free CI and Intel Macs
+          # are a niche we don't have users for yet. Mirrors streamers /
+          # indexers.
+          - os: ubuntu-latest
+            target: linux-x64
+            artifact: audimo-audiobooks-linux-x64
+          - os: windows-latest
+            target: win32-x64
+            artifact: audimo-audiobooks-win32-x64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+      - name: Build
+        run: pyinstaller audimo_audiobooks.spec --clean --noconfirm
+      - name: Rename artifact (Unix)
+        if: matrix.os != 'windows-latest'
+        run: mv dist/audimo-audiobooks dist/${{ matrix.artifact }}
+      - name: Rename artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        run: Rename-Item -Path dist\audimo-audiobooks.exe -NewName ${{ matrix.artifact }}
+        shell: pwsh
+      - name: Compute SHA256 (Unix)
+        if: matrix.os != 'windows-latest'
+        run: shasum -a 256 dist/${{ matrix.artifact }} | awk '{print $1}' > dist/${{ matrix.artifact }}.sha256
+      - name: Compute SHA256 (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 -Path "dist\${{ matrix.artifact }}").Hash.ToLower()
+          $hash | Out-File -Encoding ascii -NoNewline "dist\${{ matrix.artifact }}.sha256"
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}
+            dist/${{ matrix.artifact }}.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Resolve version + flatten artifacts
+        id: meta
+        run: |
+          set -euo pipefail
+          REF="${GITHUB_REF##*/}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${REF#audiobooks-v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          mkdir -p out
+          # actions/download-artifact v4 puts each artifact in its own
+          # subdir — flatten so we can iterate uniformly below.
+          find artifacts -mindepth 2 -type f -exec cp {} out/ \;
+          ls -la out/
+      - name: Build manifest.json
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          REPO="${GITHUB_REPOSITORY}"
+          BASE="https://github.com/${REPO}/releases/download/audiobooks-v${VERSION}"
+          read_sha() { cat "out/${1}.sha256"; }
+          cat > out/manifest.json <<EOF
+          {
+            "schema_version": 1,
+            "id": "audimo-audiobooks",
+            "name": "Audiobooks",
+            "version": "${VERSION}",
+            "min_audimo_version": "0.1.0",
+            "description": "Audiobook sources: Internet Archive (free direct streams), LibriVox (public domain), and AudiobookBay (torrents). No debrid required for IA/LibriVox.",
+            "capabilities": [
+              "resolve.sources",
+              "resolve.stream"
+            ],
+            "source_contexts": ["audiobook"],
+            "settings_schema": [
+              {
+                "type": "section",
+                "label": "Sources",
+                "description": "Pick which sources the addon queries. Internet Archive and LibriVox stream directly with no account; AudiobookBay returns magnet links that need debrid or the bundled libtorrent server.",
+                "fields": [
+                  { "key": "src_archive_enabled",     "type": "boolean", "label": "Internet Archive", "description": "Free direct streams. No account." },
+                  { "key": "src_librivox_enabled",    "type": "boolean", "label": "LibriVox",         "description": "Public-domain volunteer recordings. Free." },
+                  { "key": "src_audiobookbay_enabled","type": "boolean", "label": "AudiobookBay",     "description": "Magnet links. Needs a debrid backend or the bundled libtorrent server." }
+                ]
+              }
+            ],
+            "binaries": {
+              "darwin-arm64": {
+                "url": "${BASE}/audimo-audiobooks-darwin-arm64",
+                "sha256": "$(read_sha audimo-audiobooks-darwin-arm64)"
+              },
+              "linux-x64": {
+                "url": "${BASE}/audimo-audiobooks-linux-x64",
+                "sha256": "$(read_sha audimo-audiobooks-linux-x64)"
+              },
+              "win32-x64": {
+                "url": "${BASE}/audimo-audiobooks-win32-x64.exe",
+                "sha256": "$(read_sha audimo-audiobooks-win32-x64.exe)"
+              }
+            },
+            "default_settings": {
+              "src_archive_enabled": true,
+              "src_librivox_enabled": true,
+              "src_audiobookbay_enabled": true
+            }
+          }
+          EOF
+          cat out/manifest.json
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: audiobooks-v${{ steps.meta.outputs.version }}
+          name: Audiobooks v${{ steps.meta.outputs.version }}
+          files: |
+            out/audimo-audiobooks-darwin-arm64
+            out/audimo-audiobooks-darwin-arm64.sha256
+            out/audimo-audiobooks-linux-x64
+            out/audimo-audiobooks-linux-x64.sha256
+            out/audimo-audiobooks-win32-x64.exe
+            out/audimo-audiobooks-win32-x64.exe.sha256
+            out/manifest.json
+          fail_on_unmatched_files: true
