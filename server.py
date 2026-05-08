@@ -130,14 +130,57 @@ async def resolve_sources(request: Request):
     return {"sources": sources}
 
 
+_ABB_SKIP = {
+    "collection", "omnibus", "box set", "complete works", "collected",
+    "trilogy", "anthology", "bundle", "compendium", "complete collection",
+    "fiction collection", "hindi", "urdu",
+}
+
+
+_STOPWORDS = {"the", "a", "an", "of", "in", "on", "by", "to", "and", "for", "with"}
+
+
+def _abb_title_ok(source_name: str, search_title: str) -> bool:
+    n = source_name.lower()
+    st = search_title.lower()
+    for phrase in _ABB_SKIP:
+        if phrase in n:
+            return False
+    # Strip author (everything after " - ")
+    title_part = n.split(" - ")[0] if " - " in n else n
+    # Comma-separated or semicolon-separated multiple titles
+    if title_part.count(",") >= 1 or title_part.count(";") >= 1:
+        return False
+    # " & " always joins two distinct titles
+    if " & " in title_part:
+        return False
+    # Any significant words (len > 2, not stopwords) appearing BEFORE the first
+    # word of the search title indicate a second book prepended to this one
+    st_words = [w for w in st.split() if len(w) > 2]
+    if st_words:
+        first_word = st_words[0]
+        idx = title_part.find(first_word)
+        if idx > 0:
+            before = title_part[:idx]
+            alien = [w for w in before.split() if len(w) > 2 and w not in _STOPWORDS]
+            if alien:
+                return False
+    # Must contain all search title words
+    matched = sum(1 for w in st_words if w in title_part)
+    return matched >= max(1, len(st_words) - 1)
+
+
 async def _abb_search_wrapped(cfg: dict, title: str, author: str) -> list[dict]:
     try:
         ctx = {"title": title, "artist": author, "kind": "audiobook"}
         raw = await search_audiobookbay(cfg, ctx)
-        # Stamp with our addon_id
+        out = []
         for s in raw:
+            if not _abb_title_ok(s.get("name", ""), title):
+                continue
             s["addon_id"] = "audimo-audiobooks"
-        return raw
+            out.append(s)
+        return out
     except Exception:
         return []
 

@@ -12,7 +12,12 @@ import httpx
 
 IA_BASE = "https://archive.org"
 _IA_AUDIO_EXTS = (".mp3", ".m4b", ".m4a", ".ogg", ".opus", ".flac")
-_IA_STOPWORDS = {"the", "and", "for", "with", "from", "a", "an", "of", "in", "on", "by", "to"}
+_IA_SKIP = {
+    "collection", "omnibus", "box set", "complete works", "collected",
+    "trilogy", "anthology", "bundle", "compendium", "complete collection",
+    "fiction collection", "hindi", "urdu", "edition)",
+}
+_ASCII_RE = re.compile(r"[^\x00-\x7F]")
 
 
 def _ia_query(title: str, author: str) -> str:
@@ -23,6 +28,24 @@ def _ia_query(title: str, author: str) -> str:
         if safe_author:
             q += f' AND creator:"{safe_author}"'
     return q
+
+
+def _ia_title_ok(doc_title: str, search_title: str) -> bool:
+    """Return True if doc_title is a plausible match for search_title."""
+    dt = doc_title.lower()
+    st = search_title.lower()
+    # Drop non-ASCII (foreign-language editions)
+    if _ASCII_RE.search(doc_title):
+        return False
+    # Drop collections/compilations
+    for phrase in _IA_SKIP:
+        if phrase in dt:
+            return False
+    # The search title's words must all appear in the doc title
+    st_words = [w for w in st.split() if len(w) > 2]
+    if st_words and not all(w in dt for w in st_words):
+        return False
+    return True
 
 
 def _ia_best_file(files: list[dict]) -> dict | None:
@@ -54,6 +77,9 @@ async def search(title: str, author: str, limit: int = 5) -> list[dict]:
             for doc in docs:
                 identifier = doc.get("identifier") or ""
                 if not identifier:
+                    continue
+                doc_title = doc.get("title") or ""
+                if not _ia_title_ok(doc_title, title):
                     continue
                 # Fetch file list to find the actual audio file
                 meta_r = await c.get(f"{IA_BASE}/metadata/{identifier}", timeout=6)
