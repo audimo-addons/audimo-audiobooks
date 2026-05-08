@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "audimo-audiobooks",
   "name": "Audiobooks",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "min_audimo_version": "0.1.0",
   "description": "Audiobook sources: Internet Archive (free direct streams), LibriVox (public domain), and AudiobookBay (torrents). No debrid required for IA/LibriVox.",
   "capabilities": [
@@ -10,10 +10,37 @@
     "resolve.stream"
   ],
   "source_contexts": ["audiobook"],
+  "settings_schema": [
+    {
+      "type": "section",
+      "label": "Sources",
+      "description": "Pick which sources the addon queries. Internet Archive and LibriVox stream directly with no account; AudiobookBay returns magnet links that need debrid or the bundled libtorrent server.",
+      "fields": [
+        {
+          "key": "src_archive_enabled",
+          "type": "boolean",
+          "label": "Internet Archive",
+          "description": "Free direct streams. No account."
+        },
+        {
+          "key": "src_librivox_enabled",
+          "type": "boolean",
+          "label": "LibriVox",
+          "description": "Public-domain volunteer recordings. Free."
+        },
+        {
+          "key": "src_audiobookbay_enabled",
+          "type": "boolean",
+          "label": "AudiobookBay",
+          "description": "Magnet links. Needs a debrid backend or the bundled libtorrent server."
+        }
+      ]
+    }
+  ],
   "binaries": {
     "darwin-arm64": {
       "url": "https://github.com/audimo-addons/audimo-audiobooks/releases/latest/download/audimo-audiobooks-darwin-arm64",
-      "sha256": "d2fe4bdfe46451ec4d63f79bfd7a09c64b53de4de73cfc79554513a86d963d22"
+      "sha256": ""
     },
     "linux-x64": {
       "url": "https://github.com/audimo-addons/audimo-audiobooks/releases/latest/download/audimo-audiobooks-linux-x64",
