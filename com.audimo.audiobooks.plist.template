@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.audimo.audiobooks</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{ADDON_DIR}}/.venv/bin/python</string>
+        <string>{{ADDON_DIR}}/server.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{{ADDON_DIR}}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{{HOME}}/.audimo-audiobooks/audiobooks.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/.audimo-audiobooks/audiobooks.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AUDIMO_ADDON_PORT</key>
+        <string>9008</string>
+        <key>AUDIMO_ADDON_DATA</key>
+        <string>{{HOME}}/.audimo-audiobooks</string>
+    </dict>
+</dict>
+</plist>
