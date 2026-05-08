@@ -12,7 +12,7 @@
   "binaries": {
     "darwin-arm64": {
       "url": "https://github.com/audimo-addons/audimo-audiobooks/releases/latest/download/audimo-audiobooks-darwin-arm64",
-      "sha256": ""
+      "sha256": "d2fe4bdfe46451ec4d63f79bfd7a09c64b53de4de73cfc79554513a86d963d22"
     },
     "linux-x64": {
       "url": "https://github.com/audimo-addons/audimo-audiobooks/releases/latest/download/audimo-audiobooks-linux-x64",
