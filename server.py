@@ -5,34 +5,24 @@ Sources:
   - LibriVox (public domain zip, free, no debrid)
   - AudiobookBay (magnet links, needs debrid or local libtorrent)
 
-AudiobookBay code is imported from audimo-indexers when running
-natively (co-located dev). In the shipped binary it is bundled
-directly.
+AudiobookBay logic is vendored under ``sources/`` so the shipped
+PyInstaller binary doesn't depend on the audimo-indexers repo
+sitting alongside it at runtime.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import sys
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from sources import archive_org, librivox
-
-# ── AudiobookBay: import from indexers repo if available, else stub ──
-try:
-    _indexers_path = Path(__file__).resolve().parent.parent / "audimo-indexers"
-    if _indexers_path.is_dir() and str(_indexers_path) not in sys.path:
-        sys.path.insert(0, str(_indexers_path))
-    from indexers.audiobookbay import search_audiobookbay, _abb_fetch_magnet
-    _HAS_ABB = True
-except ImportError:
-    _HAS_ABB = False
+from sources.audiobookbay import search_audiobookbay, _abb_fetch_magnet
 
 PORT = int(os.environ.get("AUDIMO_ADDON_PORT", 9008))
 SETTINGS_PATH = Path(os.environ.get("AUDIMO_ADDON_DATA", Path.home() / ".audimo-audiobooks")) / "settings.json"
@@ -118,7 +108,7 @@ async def resolve_sources(request: Request):
     if cfg.get("src_librivox_enabled", True):
         tasks.append(librivox.search(title, author, limit=2))
 
-    if cfg.get("src_audiobookbay_enabled", True) and _HAS_ABB:
+    if cfg.get("src_audiobookbay_enabled", True):
         tasks.append(_abb_search_wrapped(cfg, title, author))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -178,6 +168,14 @@ async def _abb_search_wrapped(cfg: dict, title: str, author: str) -> list[dict]:
         for s in raw:
             if not _abb_title_ok(s.get("name", ""), title):
                 continue
+            # Stamp the dispatch key resolve.stream looks for (`abb:<slug>`).
+            # The indexers-shaped result carries the slug as `topic_id`;
+            # without re-projecting it as source_id, the source picker
+            # would show the row but resolve.stream would fall through
+            # to "Unknown source" and the user couldn't play it.
+            slug = (s.get("topic_id") or "").strip()
+            if slug:
+                s["source_id"] = f"abb:{slug}"
             s["addon_id"] = "audimo-audiobooks"
             out.append(s)
         return out
@@ -218,7 +216,7 @@ async def resolve_stream(request: Request):
         return StreamingResponse(_torrent_sse(), media_type="text/event-stream")
 
     # ABB: fetch magnet from slug if source_id starts with "abb:"
-    if source_id.startswith("abb:") and _HAS_ABB:
+    if source_id.startswith("abb:"):
         slug = source_id.split(":", 1)[1]
         cfg = _load_settings()
         magnet = await _abb_fetch_magnet(cfg, slug) or ""
@@ -230,6 +228,67 @@ async def resolve_stream(request: Request):
     async def _not_found():
         yield f"data: {json.dumps({'type': 'error', 'status': 'error', 'message': 'Unknown source'})}\n\n"
     return StreamingResponse(_not_found(), media_type="text/event-stream")
+
+
+@app.get("/configure", response_class=HTMLResponse)
+async def configure():
+    """Minimal HTML form for the three source toggles. Posts back to
+    /settings, then notifies the parent window so the AddonsView shows
+    a Saved toast. Settings persist locally in `SETTINGS_PATH` — this
+    addon doesn't carry secrets in the URL like the indexer addon
+    does, so the form doesn't need to round-trip a new addon URL."""
+    s = _load_settings()
+    def chk(k: str) -> str:
+        return "checked" if s.get(k, True) else ""
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Audiobooks settings</title>
+<style>
+  body {{ font: 14px -apple-system, system-ui, sans-serif; background:#1a1816; color:#e6e2db; padding:32px; max-width:560px; margin:0 auto; }}
+  h1 {{ font-size:18px; margin:0 0 6px; }}
+  p.lede {{ color:#8a857d; margin:0 0 24px; font-size:13px; line-height:1.5; }}
+  label {{ display:flex; align-items:center; gap:10px; padding:14px 0; border-bottom:1px solid #26231f; cursor:pointer; }}
+  label:last-of-type {{ border-bottom:none; }}
+  input[type=checkbox] {{ width:18px; height:18px; accent-color:#c9a96a; }}
+  .name {{ font-weight:600; }}
+  .desc {{ color:#8a857d; font-size:12px; margin-top:2px; }}
+  button {{ background:transparent; color:#e6e2db; border:1px solid #c9a96a; padding:10px 20px; font:inherit; cursor:pointer; margin-top:24px; }}
+  button:hover {{ background:#c9a96a; color:#1a1816; }}
+  #status {{ color:#c9a96a; margin-left:14px; font-size:12px; }}
+</style>
+</head><body>
+<h1>Audiobook sources</h1>
+<p class="lede">Toggle which sources the addon queries. Internet Archive and LibriVox stream directly; AudiobookBay returns magnet links that need debrid or the bundled libtorrent server.</p>
+<form id="f">
+  <label><input type="checkbox" name="src_archive_enabled" {chk("src_archive_enabled")}>
+    <span><div class="name">Internet Archive</div><div class="desc">Free direct streams. No account.</div></span></label>
+  <label><input type="checkbox" name="src_librivox_enabled" {chk("src_librivox_enabled")}>
+    <span><div class="name">LibriVox</div><div class="desc">Public-domain volunteer recordings. Free.</div></span></label>
+  <label><input type="checkbox" name="src_audiobookbay_enabled" {chk("src_audiobookbay_enabled")}>
+    <span><div class="name">AudiobookBay</div><div class="desc">Magnet links. Needs a debrid backend or the bundled libtorrent server.</div></span></label>
+  <button type="submit">Save</button>
+  <span id="status"></span>
+</form>
+<script>
+document.getElementById('f').addEventListener('submit', async (e) => {{
+  e.preventDefault();
+  const data = {{}};
+  for (const cb of document.querySelectorAll('input[type=checkbox]')) {{
+    data[cb.name] = cb.checked;
+  }}
+  const r = await fetch('./settings', {{ method:'POST', headers:{{'content-type':'application/json'}}, body: JSON.stringify(data) }});
+  document.getElementById('status').textContent = r.ok ? 'Saved.' : 'Save failed.';
+  // Notify the AddonsView opener so it shows a toast. The addon URL
+  // didn't change (settings are local) but the parent listens for any
+  // postMessage with a `url` field — re-sending the current URL is a
+  // benign no-op on the registry side.
+  if (r.ok && window.opener) {{
+    try {{ window.opener.postMessage({{ url: window.location.origin }}, '*'); }} catch (e) {{}}
+  }}
+}});
+</script>
+</body></html>
+"""
+    return HTMLResponse(html)
 
 
 @app.get("/health")
