@@ -138,7 +138,8 @@ jobs:
             "description": "Audiobook sources: Internet Archive (free direct streams), LibriVox (public domain), and AudiobookBay (torrents). No debrid required for IA/LibriVox.",
             "capabilities": [
               "resolve.sources",
-              "resolve.stream"
+              "resolve.stream",
+              "cache.resolve"
             ],
             "source_contexts": ["audiobook"],
             "settings_schema": [
