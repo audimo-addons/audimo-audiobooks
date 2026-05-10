@@ -351,6 +351,45 @@ async def resolve_stream(request: Request):
     return StreamingResponse(_not_found(), media_type="text/event-stream")
 
 
+# ── cache.resolve ──────────────────────────────────────────────
+#
+# Core's resolve flow: when a play hits a cached library row whose
+# `addon_id` is ours, core delegates to this endpoint for a fresh
+# stream URL. Internet Archive + LibriVox sources return permanent
+# upstream URLs, so the cached `streamUrl` is still valid — we just
+# echo it back. AudiobookBay magnet entries can't be re-resolved
+# without a debrid backend; core's frontend treats a missing
+# streamUrl as "addon couldn't refresh" and falls back to whatever
+# is on the cached entry, so we surface a concrete error in the
+# response shape rather than 404'ing the call.
+
+@app.post("/cache/resolve")
+async def cache_resolve(request: Request):
+    body = await request.json()
+    # Core sends the entire cached entry payload (per addon protocol
+    # §6). Most fields are opaque to us; we only care about pulling
+    # back a stream URL.
+    stream_url = body.get("streamUrl") or body.get("stream_url") or ""
+    source = body.get("source") or "Audiobooks"
+    mime = body.get("mime_type") or body.get("mimeType") or "audio/mpeg"
+
+    if stream_url:
+        return {
+            "streamUrl": stream_url,
+            "mimeType": mime,
+            "source": source,
+        }
+
+    # AudiobookBay-sourced rows might have only a magnet link saved
+    # — re-resolution would need libtorrent or debrid, neither of
+    # which this addon can do. Tell core, so the frontend can
+    # surface a useful message instead of pretending playback works.
+    return {
+        "status": "error",
+        "message": "Audiobook source requires libtorrent or debrid to re-resolve — replay it from the original search to refresh.",
+    }
+
+
 @app.get("/configure", response_class=HTMLResponse)
 async def configure():
     """Minimal HTML form for the three source toggles. Posts back to

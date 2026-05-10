@@ -2,12 +2,13 @@
   "schema_version": 1,
   "id": "audimo-audiobooks",
   "name": "Audiobooks",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "min_audimo_version": "0.1.0",
   "description": "Audiobook sources: Internet Archive (free direct streams), LibriVox (public domain), and AudiobookBay (torrents). No debrid required for IA/LibriVox.",
   "capabilities": [
     "resolve.sources",
-    "resolve.stream"
+    "resolve.stream",
+    "cache.resolve"
   ],
   "source_contexts": ["audiobook"],
   "settings_schema": [
