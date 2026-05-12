@@ -116,6 +116,33 @@ async def _host_allowlist(request: Request, call_next):
     return await call_next(request)
 
 
+# Optional addon-key gate — matches the same env-flag pattern the
+# other addons use. Unset = no check (the default for the Tauri
+# sidecar / local dev). Set when hosting publicly so the /settings
+# endpoint (which lets any caller flip source toggles) isn't open
+# to the internet.
+_ADDON_KEY = (os.environ.get("AUDIMO_ADDON_KEY") or "").strip()
+# Paths that stay public regardless of key state. /manifest.json is
+# how addon clients bootstrap; /health is the standard container probe.
+_PUBLIC_PATH_ENDINGS = ("/manifest.json", "/health")
+
+
+@app.middleware("http")
+async def _require_addon_key(request: Request, call_next):
+    if not _ADDON_KEY:
+        return await call_next(request)
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    p = request.url.path
+    if any(p.endswith(s) for s in _PUBLIC_PATH_ENDINGS):
+        return await call_next(request)
+    presented = request.headers.get("x-audimo-addon-key", "").strip()
+    if not presented or presented != _ADDON_KEY:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": "addon key required"}, status_code=401)
+    return await call_next(request)
+
+
 _CORS_EXTRA = [
     o.strip()
     for o in (os.environ.get("AUDIMO_ADDON_CORS_EXTRA") or "").split(",")
@@ -168,10 +195,43 @@ async def get_settings():
     return _load_settings()
 
 
+_SETTINGS_SCHEMA: dict[str, type] = {
+    "src_archive_enabled": bool,
+    "src_librivox_enabled": bool,
+    "src_audiobookbay_enabled": bool,
+}
+
+
 @app.post("/settings")
 async def post_settings(request: Request):
+    """Update settings. Validates against ``_SETTINGS_SCHEMA`` so a
+    malicious caller can't bloat the on-disk file with arbitrary
+    keys or coerce types the source loaders don't expect."""
     body = await request.json()
-    s = {**_load_settings(), **body}
+    if not isinstance(body, dict):
+        return JSONResponse({"detail": "body must be an object"}, status_code=400)
+    if len(body) > 32:
+        return JSONResponse({"detail": "too many fields"}, status_code=400)
+    cleaned: dict = {}
+    for k, expected_type in _SETTINGS_SCHEMA.items():
+        if k not in body:
+            continue
+        v = body[k]
+        if not isinstance(v, expected_type):
+            return JSONResponse(
+                {"detail": f"{k} must be {expected_type.__name__}"},
+                status_code=400,
+            )
+        cleaned[k] = v
+    # Reject unknown keys explicitly so a typo doesn't silently
+    # write garbage to disk.
+    unknown = set(body.keys()) - set(_SETTINGS_SCHEMA.keys())
+    if unknown:
+        return JSONResponse(
+            {"detail": f"unknown setting(s): {sorted(unknown)}"},
+            status_code=400,
+        )
+    s = {**_load_settings(), **cleaned}
     _save_settings(s)
     return s
 
