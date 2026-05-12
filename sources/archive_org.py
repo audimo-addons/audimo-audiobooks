@@ -48,13 +48,102 @@ def _ia_title_ok(doc_title: str, search_title: str) -> bool:
     return True
 
 
+# Format preference order. We rank MP3 / M4B above FLAC because IA's
+# CDN occasionally returns 500 on Range-less GETs of large FLAC files
+# (and ffmpeg's HTTP demuxer doesn't send Range by default), and
+# because Safari/WKWebView decodes MP3/M4B more reliably than IA-
+# delivered FLAC even when the latter does serve. FLAC stays as a
+# last-resort so items that only ship .flac still surface.
+_IA_FORMAT_RANK = {
+    ".m4b": 0,   # native audiobook container, has chapter atoms
+    ".mp3": 1,   # universal browser support
+    ".m4a": 2,
+    ".aac": 3,
+    ".ogg": 4,
+    ".opus": 5,
+    ".flac": 6,
+}
+
+
+def _ia_ext(name: str) -> str:
+    n = (name or "").lower()
+    i = n.rfind(".")
+    return n[i:] if i >= 0 else ""
+
+
 def _ia_best_file(files: list[dict]) -> dict | None:
-    audio = [f for f in files if f.get("name", "").lower().endswith(_IA_AUDIO_EXTS)]
+    audio = [f for f in files if _ia_ext(f.get("name", "")) in _IA_FORMAT_RANK]
     if not audio:
         return None
-    # Prefer the largest single-file (fewest chapters = one big MP3 is the full book)
-    audio.sort(key=lambda f: int(f.get("size") or 0), reverse=True)
+    # Primary sort: format preference (low rank wins). Secondary: size
+    # descending — when multiple files of the same format exist, the
+    # biggest one is usually the complete single-file audiobook
+    # instead of a per-chapter split.
+    audio.sort(key=lambda f: (
+        _IA_FORMAT_RANK.get(_ia_ext(f.get("name", "")), 99),
+        -int(f.get("size") or 0),
+    ))
     return audio[0]
+
+
+# Non-English language codes we explicitly skip. IA uses a mix of
+# MARC-21 (3-letter, "ger") and ISO 639-2 (also 3-letter) codes;
+# we lowercase + match either. ``None`` / "" / "eng" / "en" all pass
+# through — most popular English audiobooks ship without a language
+# tag, and the false-positive cost of dropping them is too high.
+_IA_NON_ENGLISH_LANGS = {
+    "ger", "de", "deu",          # German
+    "fre", "fra", "fr",          # French
+    "spa", "es",                 # Spanish
+    "ita", "it",                 # Italian
+    "dut", "nld", "nl",          # Dutch
+    "swe", "sv",                 # Swedish
+    "rus", "ru",                 # Russian
+    "por", "pt",                 # Portuguese
+    "chi", "zho", "zh",          # Chinese
+    "jpn", "ja",                 # Japanese
+    "kor", "ko",                 # Korean
+    "ara", "ar",                 # Arabic
+    "hin", "hi",                 # Hindi
+    "tur", "tr",                 # Turkish
+    "pol", "pl",                 # Polish
+    "ces", "cs", "cze",          # Czech
+    "fin", "fi",                 # Finnish
+    "nor", "nob", "nno", "no",   # Norwegian
+    "dan", "da",                 # Danish
+}
+
+# Substring markers in titles that signal a non-English edition even
+# when the language field is missing. Catches the dozens of German
+# "Hörspiel" items that bury the popular English audiobook in
+# downloads-desc sort.
+_IA_NON_ENGLISH_TITLE_MARKERS = {
+    "hörspiel", "horspiel", "komplettfassung", "ungekürzt",
+    "abridged german", "deutsche", "französische", "italiana",
+    "ediz. tedesca", "edizione tedesca",
+}
+
+
+def _ia_is_english(doc: dict) -> bool:
+    """Conservative English filter: reject documents whose declared
+    language is on the non-English block list OR whose title carries
+    a language-specific marker. Allows everything else through —
+    most IA audiobooks ship without a language tag and dropping them
+    would silently kill English search results."""
+    lang = (doc.get("language") or "").lower().strip()
+    if lang in _IA_NON_ENGLISH_LANGS:
+        return False
+    if "," in lang:
+        # Multilingual entries (e.g. "eng, ger") — accept if English is
+        # one of the listed languages, reject if it's only non-English.
+        parts = {p.strip() for p in lang.split(",")}
+        if not (parts & {"eng", "en"}) and (parts & _IA_NON_ENGLISH_LANGS):
+            return False
+    title_l = (doc.get("title") or "").lower()
+    for marker in _IA_NON_ENGLISH_TITLE_MARKERS:
+        if marker in title_l:
+            return False
+    return True
 
 
 async def search(title: str, author: str, limit: int = 5) -> list[dict]:
@@ -64,7 +153,7 @@ async def search(title: str, author: str, limit: int = 5) -> list[dict]:
                 f"{IA_BASE}/advancedsearch.php",
                 params={
                     "q": _ia_query(title, author),
-                    "fl": "identifier,title,creator,subject",
+                    "fl": "identifier,title,creator,subject,language",
                     "output": "json",
                     "rows": limit * 3,
                     "sort": "downloads desc",
@@ -81,16 +170,35 @@ async def search(title: str, author: str, limit: int = 5) -> list[dict]:
                 doc_title = doc.get("title") or ""
                 if not _ia_title_ok(doc_title, title):
                     continue
+                # Filter out non-English editions — the popular 1984
+                # search used to land on a German "Hörspiel" radio
+                # play (~10x more downloads than the English audio
+                # book in the same query, ranked first by IA's
+                # downloads-desc sort).
+                if not _ia_is_english(doc):
+                    continue
                 # Fetch file list to find the actual audio file
                 meta_r = await c.get(f"{IA_BASE}/metadata/{identifier}", timeout=6)
                 if meta_r.status_code != 200:
                     continue
-                files = meta_r.json().get("files") or []
+                meta = meta_r.json()
+                files = meta.get("files") or []
                 best = _ia_best_file(files)
                 if not best:
                     continue
                 fname = best["name"]
-                stream_url = f"{IA_BASE}/download/{identifier}/{fname}"
+                # Skip archive.org's load balancer (which sometimes
+                # 302s to a broken mirror like dn721807.ca.archive.org
+                # that 500s on every Range request). The metadata
+                # endpoint hands us the canonical storage server +
+                # directory; constructing the direct URL avoids the
+                # roulette entirely.
+                ia_server = meta.get("server") or meta.get("d1") or ""
+                ia_dir = meta.get("dir") or ""
+                if ia_server and ia_dir:
+                    stream_url = f"https://{ia_server}{ia_dir}/{fname}"
+                else:
+                    stream_url = f"{IA_BASE}/download/{identifier}/{fname}"
                 size_bytes = int(best.get("size") or 0)
                 results.append({
                     "addon_id": "audimo-audiobooks",
